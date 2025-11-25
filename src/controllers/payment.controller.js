@@ -58,7 +58,7 @@ console.log('🔍 DEBUG - ENVIRONMENT:', config.ENVIRONMENT);
                     title: title.substring(0, 100),
                     quantity: Math.max(1, Math.min(numQuantity, 100)),
                     unit_price: numPrice,
-                    currency_id: 'ARS',
+                    currency_id: 'MXN',
                     description: description || `Servicio de ${title}`
                 }
             ],
