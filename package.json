@@ -11,7 +11,11 @@
     "type": "git",
     "url": "git+https://github.com/leandros1793/HoyoenUno.git"
   },
-  "keywords": ["mercadopago", "golf", "payments"],
+  "keywords": [
+    "mercadopago",
+    "golf",
+    "payments"
+  ],
   "author": "Hoyo en Uno",
   "license": "ISC",
   "bugs": {
@@ -19,6 +23,7 @@
   },
   "homepage": "https://github.com/leandros1793/HoyoenUno#readme",
   "dependencies": {
+    "@supabase/supabase-js": "^2.84.0",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
