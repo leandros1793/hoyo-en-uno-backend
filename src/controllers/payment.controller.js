@@ -266,6 +266,219 @@ const createPreference = async (req, res) => {
     }
 };
 
+const createMembershipPreference = async (req, res) => {
+    try {
+        console.log('\n🎫 Nueva solicitud de membresía recibida');
+        console.log('Datos:', JSON.stringify(req.body, null, 2));
+        
+        const { 
+            membershipType,  // 'BOGEY_PASS', 'BIRDIE_PLUS', 'HOLE_IN_ONE'
+            customerName,
+            customerEmail,
+            customerPhone,
+            customerNotes
+        } = req.body;
+        
+        // ===== VALIDACIONES =====
+        if (!membershipType || !customerName || !customerEmail || !customerPhone) {
+            return res.status(400).json({
+                error: 'Datos incompletos',
+                required: ['membershipType', 'customerName', 'customerEmail', 'customerPhone'],
+                received: req.body
+            });
+        }
+
+        const validTypes = ['BOGEY_PASS', 'BIRDIE_PLUS', 'HOLE_IN_ONE'];
+        if (!validTypes.includes(membershipType)) {
+            return res.status(400).json({
+                error: 'Tipo de membresía inválido',
+                valid: validTypes,
+                received: membershipType
+            });
+        }
+
+        // ===== OBTENER DATOS DE LA MEMBRESÍA =====
+        const { data: membershipData, error: membershipError } = await supabase
+            .from('membership_types')
+            .select('*')
+            .eq('code', membershipType)
+            .eq('active', true)
+            .single();
+
+        if (membershipError || !membershipData) {
+            console.error('❌ Error al obtener membresía:', membershipError);
+            return res.status(404).json({
+                error: 'Membresía no encontrada',
+                type: membershipType
+            });
+        }
+
+        console.log('✅ Membresía encontrada:', membershipData.name);
+        console.log('💰 Precio:', `$${membershipData.price} MXN`);
+
+        // ===== GENERAR REFERENCIA ÚNICA =====
+        const referenceId = 'membership-' + Date.now();
+        
+        // ===== CALCULAR FECHAS =====
+        const startDate = new Date();
+        const endDate = new Date();
+        endDate.setDate(endDate.getDate() + membershipData.duration_days);
+
+        console.log('📅 Vigencia:', {
+            start: startDate.toISOString().split('T')[0],
+            end: endDate.toISOString().split('T')[0],
+            days: membershipData.duration_days
+        });
+
+        // ===== GUARDAR MEMBRESÍA TEMPORAL EN SUPABASE =====
+        const membershipRecord = {
+            reference_id: referenceId,
+            customer_name: customerName,
+            customer_email: customerEmail,
+            customer_phone: customerPhone,
+            membership_type: membershipType,
+            status: 'pending', // ⬅️ Pendiente hasta que se pague
+            start_date: startDate.toISOString().split('T')[0],
+            end_date: endDate.toISOString().split('T')[0],
+            monthly_price: parseFloat(membershipData.price),
+            hours_remaining: parseFloat(membershipData.hours_included || 0),
+            classes_remaining: parseInt(membershipData.classes_included || 0),
+            notes: customerNotes || null
+        };
+
+        console.log('💾 Guardando membresía temporal en Supabase...');
+
+        try {
+            const { data: savedMembership, error: saveMembershipError } = await supabase
+                .from('memberships')
+                .insert([membershipRecord])
+                .select()
+                .single();
+
+            if (saveMembershipError) {
+                console.error('❌ Error de Supabase:', saveMembershipError);
+                throw new Error(`Error al guardar membresía: ${saveMembershipError.message}`);
+            }
+
+            console.log('✅ Membresía temporal guardada con ID:', savedMembership.id);
+
+        } catch (supabaseError) {
+            console.error('❌ Error al guardar en Supabase:', supabaseError);
+            return res.status(500).json({
+                success: false,
+                error: 'Error al guardar la membresía',
+                message: supabaseError.message
+            });
+        }
+
+        // ===== CONFIGURAR PREFERENCIA DE MERCADO PAGO =====
+        const baseUrl = config.BASE_URL.endsWith('/') 
+            ? config.BASE_URL.slice(0, -1) 
+            : config.BASE_URL;
+
+        const body = {
+            items: [
+                {
+                    id: referenceId,
+                    title: membershipData.name,
+                    quantity: 1,
+                    unit_price: parseFloat(membershipData.price),
+                    currency_id: 'MXN',
+                    description: `Membresía mensual - ${membershipData.name}`
+                }
+            ],
+            back_urls: {
+                success: baseUrl + '/payment/success',
+                failure: baseUrl + '/payment/failure',
+                pending: baseUrl + '/payment/pending'
+            },
+            auto_return: 'approved',
+            statement_descriptor: 'HOYO EN UNO MBR',
+            external_reference: referenceId,
+            notification_url: baseUrl + '/payment/webhook',
+            binary_mode: true,
+            payer: {
+                name: customerName,
+                email: customerEmail,
+                phone: {
+                    number: customerPhone
+                }
+            }
+        };
+
+        console.log('🔗 URLs configuradas para membresía');
+        console.log('- Success:', body.back_urls.success);
+
+        // ===== CREAR PREFERENCIA EN MERCADO PAGO =====
+        try {
+            console.log('\n🚀 Enviando a Mercado Pago...');
+            
+            const response = await preference.create({ body });
+            
+            console.log('\n✅ Preferencia de membresía creada:');
+            console.log('- ID:', response.id);
+            console.log('- Referencia:', referenceId);
+            
+            if (!response || !response.id) {
+                throw new Error('Respuesta inválida de Mercado Pago');
+            }
+            
+            const checkoutUrl = config.ENVIRONMENT === 'sandbox' 
+                ? response.sandbox_init_point 
+                : response.init_point;
+            
+            if (!checkoutUrl) {
+                throw new Error('No se pudo obtener la URL de pago');
+            }
+            
+            // ===== RESPUESTA EXITOSA =====
+            res.json({ 
+                success: true,
+                id: response.id,
+                checkout_url: checkoutUrl,
+                reference: referenceId,
+                membership: {
+                    type: membershipType,
+                    name: membershipData.name,
+                    price: membershipData.price,
+                    duration_days: membershipData.duration_days,
+                    start_date: startDate.toISOString().split('T')[0],
+                    end_date: endDate.toISOString().split('T')[0]
+                },
+                environment: config.ENVIRONMENT,
+                message: 'Preferencia de membresía creada exitosamente'
+            });
+            
+        } catch (mpError) {
+            console.error('\n❌ Error de Mercado Pago:', mpError);
+
+            // Eliminar membresía temporal si falla MP
+            console.log('🗑️ Eliminando membresía temporal...');
+            try {
+                await supabase
+                    .from('memberships')
+                    .delete()
+                    .eq('reference_id', referenceId);
+                console.log('✅ Membresía temporal eliminada');
+            } catch (deleteError) {
+                console.error('❌ Error al eliminar:', deleteError);
+            }
+            
+            throw new Error(`Error de Mercado Pago: ${mpError.message}`);
+        }
+        
+    } catch (error) {
+        console.error('\n🔥 Error general:', error);
+        
+        res.status(500).json({ 
+            success: false,
+            error: 'Error al procesar la membresía',
+            message: error.message
+        });
+    }
+};
+
+
 // ============================================
 // CALLBACK: PAGO EXITOSO
 // ============================================
@@ -282,51 +495,81 @@ const successPayment = async (req, res) => {
         merchant_order_id 
     } = req.query;
 
-    // ===== ACTUALIZAR RESERVAS EN SUPABASE =====
-    try {
-        console.log('💾 Actualizando reservas en Supabase...');
-        console.log('🔑 Buscando por reference_id:', external_reference);
+    // ===== DETERMINAR SI ES MEMBRESÍA O RESERVA =====
+    const isMembership = external_reference?.startsWith('membership-');
 
-        const { data: reservasActualizadas, error } = await supabase
-            .from('reservations')
-            .update({
-                payment_id: payment_id || null,
-                status: 'confirmed', // ⬅️ Cambiar de 'pending' a 'confirmed'
-                payment_status: 'paid',
-                confirmed_at: new Date().toISOString(),
-                payment_type: payment_type || null,
-                merchant_order_id: merchant_order_id || null
-            })
-            .eq('reference_id', external_reference) // ⬅️ Buscar por referencia
-            .select();
+    if (isMembership) {
+        // ===== ACTUALIZAR MEMBRESÍA =====
+        try {
+            console.log('🎫 Actualizando membresía en Supabase...');
 
-        if (error) {
-            console.error('❌ Error actualizando reservas en Supabase:', error);
-        } else {
-            console.log(`✅ ${reservasActualizadas?.length || 0} reserva(s) confirmada(s)`);
-            console.log('📝 Reservas actualizadas:', reservasActualizadas);
+            const { data: updatedMembership, error } = await supabase
+                .from('memberships')
+                .update({
+                    payment_id: payment_id || null,
+                    status: 'active', // ⬅️ ACTIVAR membresía
+                    payment_type: payment_type || null,
+                    updated_at: new Date().toISOString()
+                })
+                .eq('reference_id', external_reference)
+                .select()
+                .single();
+
+            if (error) {
+                console.error('❌ Error actualizando membresía:', error);
+            } else {
+                console.log('✅ Membresía activada:', updatedMembership);
+            }
+
+        } catch (error) {
+            console.error('❌ Error:', error);
         }
+    } else {
+        // ===== ACTUALIZAR RESERVAS (código existente) =====
+        try {
+            console.log('💾 Actualizando reservas en Supabase...');
 
-    } catch (error) {
-        console.error('❌ Error en actualización de Supabase:', error);
+            const { data: reservasActualizadas, error } = await supabase
+                .from('reservations')
+                .update({
+                    payment_id: payment_id || null,
+                    status: 'confirmed',
+                    payment_status: 'paid',
+                    confirmed_at: new Date().toISOString(),
+                    payment_type: payment_type || null,
+                    merchant_order_id: merchant_order_id || null
+                })
+                .eq('reference_id', external_reference)
+                .select();
+
+            if (error) {
+                console.error('❌ Error actualizando reservas:', error);
+            } else {
+                console.log(`✅ ${reservasActualizadas?.length || 0} reserva(s) confirmada(s)`);
+            }
+
+        } catch (error) {
+            console.error('❌ Error:', error);
+        }
     }
 
-    // ===== MOSTRAR HTML DE ÉXITO =====
+    // ===== MOSTRAR HTML (igual para ambos) =====
+    const title = isMembership ? '¡Membresía Activada!' : '¡Pago Exitoso!';
+    const message = isMembership 
+        ? 'Tu membresía ha sido <strong>activada exitosamente</strong>.' 
+        : 'Tu reserva ha sido <strong>confirmada y pagada</strong>.';
+
     res.send(`
         <!DOCTYPE html>
         <html lang="es">
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Pago Exitoso - Hoyo en Uno</title>
+            <title>${title} - Hoyo en Uno</title>
             <style>
-                * {
-                    margin: 0;
-                    padding: 0;
-                    box-sizing: border-box;
-                }
+                * { margin: 0; padding: 0; box-sizing: border-box; }
                 body {
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
                     display: flex;
                     justify-content: center;
                     align-items: center;
@@ -354,17 +597,8 @@ const successPayment = async (req, res) => {
                     0%, 100% { transform: translateY(0); }
                     50% { transform: translateY(-10px); }
                 }
-                h1 { 
-                    font-size: 2.2rem; 
-                    margin-bottom: 1rem;
-                    font-weight: 700;
-                }
-                p { 
-                    font-size: 1.1rem; 
-                    opacity: 0.95; 
-                    margin-bottom: 0.75rem;
-                    line-height: 1.6;
-                }
+                h1 { font-size: 2.2rem; margin-bottom: 1rem; font-weight: 700; }
+                p { font-size: 1.1rem; opacity: 0.95; margin-bottom: 0.75rem; line-height: 1.6; }
                 .info { 
                     background: rgba(255,255,255,0.15); 
                     padding: 1.5rem; 
@@ -372,13 +606,7 @@ const successPayment = async (req, res) => {
                     margin: 1.5rem 0;
                     text-align: left;
                 }
-                .info p {
-                    margin-bottom: 0.5rem;
-                    font-size: 1rem;
-                }
-                .info p:last-child {
-                    margin-bottom: 0;
-                }
+                .info p { margin-bottom: 0.5rem; font-size: 1rem; }
                 .status-badge {
                     display: inline-block;
                     background: #25d366;
@@ -400,47 +628,27 @@ const successPayment = async (req, res) => {
                     font-weight: 600;
                     font-size: 1.1rem;
                     transition: all 0.3s ease;
-                    box-shadow: 0 4px 15px rgba(37, 211, 102, 0.3);
                 }
-                .btn:hover { 
-                    background: #1da851;
-                    transform: translateY(-2px);
-                    box-shadow: 0 6px 20px rgba(37, 211, 102, 0.4);
-                }
-                .footer-note {
-                    margin-top: 2rem;
-                    font-size: 0.9rem;
-                    opacity: 0.8;
-                }
-                @media (max-width: 480px) {
-                    .container {
-                        padding: 2rem 1.5rem;
-                    }
-                    h1 {
-                        font-size: 1.8rem;
-                    }
-                    .icon {
-                        font-size: 60px;
-                    }
-                }
+                .btn:hover { background: #1da851; transform: translateY(-2px); }
             </style>
         </head>
         <body>
             <div class="container">
                 <div class="icon">✅</div>
-                <h1>¡Pago Exitoso!</h1>
-                <p>Tu reserva ha sido <strong>confirmada y pagada</strong>.</p>
+                <h1>${title}</h1>
+                <p>${message}</p>
                 
                 <div class="info">
                     <p><strong>📋 ID de pago:</strong> ${payment_id || 'N/A'}</p>
                     <p><strong>🔖 Referencia:</strong> ${external_reference || 'N/A'}</p>
-                    <p><strong>💳 Método:</strong> ${payment_type === 'credit_card' ? 'Tarjeta de Crédito' : payment_type === 'debit_card' ? 'Tarjeta de Débito' : 'Mercado Pago'}</p>
-                    <span class="status-badge">✓ CONFIRMADA</span>
+                    <p><strong>💳 Método:</strong> ${payment_type === 'credit_card' ? 'Tarjeta de Crédito' : 'Mercado Pago'}</p>
+                    <span class="status-badge">✓ ${isMembership ? 'ACTIVA' : 'CONFIRMADA'}</span>
                 </div>
                 
-                <p class="footer-note">
-                    ✉️ Recibirás un correo de confirmación<br>
-                    📱 También te contactaremos por WhatsApp
+                <p style="margin-top: 1.5rem; font-size: 0.95rem;">
+                    ${isMembership 
+                        ? '📧 Recibirás un correo con los detalles de tu membresía<br>📱 También te contactaremos por WhatsApp' 
+                        : '✉️ Recibirás un correo de confirmación<br>📱 También te contactaremos por WhatsApp'}
                 </p>
                 
                 <a href="/" class="btn">⛳ Volver al inicio</a>
@@ -449,7 +657,6 @@ const successPayment = async (req, res) => {
         </html>
     `);
 };
-
 // ============================================
 // CALLBACK: PAGO FALLIDO
 // ============================================
@@ -676,6 +883,7 @@ const pendingPayment = async (req, res) => {
 
 module.exports = {
     createPreference,
+     createMembershipPreference, 
     successPayment,
     failurePayment,
     pendingPayment
